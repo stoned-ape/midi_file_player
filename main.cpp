@@ -27,6 +27,8 @@
 #include <windows.h>
 #include <dsound.h>
 
+#include <immintrin.h>
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
@@ -50,7 +52,7 @@
 
 #define PRINT(val,type) printf("%s:\t" type "\n",#val,val)
 
-const float pi=3.141592653589793f;
+constexpr float pi=3.141592653589793f;
 
 
 double itime(){
@@ -627,51 +629,108 @@ int WINAPI WinMain(	[[maybe_unused]]HINSTANCE hi,
 		if(smp_min==smp_max) continue;
 		assert(smp_min<smp_max);
 
-		
+		#define FILL4(x) {x,x,x,x}
+		#define FILL8(x) {x,x,x,x,x,x,x,x}
 
+		[[maybe_unused]]
+		auto sin8f=[](__m256 x)->__m256{
+			static constexpr float coefs[4]={1.0f,-1/6.0f,1/120.0f,-1/5040.0f};
+			static constexpr __m256 vcoefs[4]={
+				FILL8(coefs[0]),FILL8(coefs[1]),FILL8(coefs[2]),FILL8(coefs[3]),
+			};
+			static constexpr __m256 vpi=FILL8(pi);
+			static constexpr __m256 v2pi=FILL8(2*pi);
+			x=_mm256_sub_ps(x,vpi);
+			__m256 q=_mm256_floor_ps(_mm256_div_ps(x,v2pi));
+			x=_mm256_sub_ps(x,_mm256_mul_ps(q,v2pi));
+			x=_mm256_sub_ps(x,vpi);
+			const __m256 x_sq=_mm256_mul_ps(x,x);
+			__m256 res=FILL8(0);
+			for(int i=0;i<4;i++){
+				res=_mm256_add_ps(res,_mm256_mul_ps(vcoefs[i],x));
+				x=_mm256_mul_ps(x,x_sq);
+			}
+			return res;
+		};
+
+		[[maybe_unused]]
+		auto saw8f=[](__m256 x)->__m256{
+			static constexpr __m256 ones=FILL8(1);
+			static constexpr __m256 twos=FILL8(2);
+			__m256 q=_mm256_floor_ps(x);
+			x=_mm256_sub_ps(x,q);
+			x=_mm256_mul_ps(x,twos);
+			x=_mm256_sub_ps(x,ones);
+			return x;
+		};
+
+		[[maybe_unused]]
+		auto square8f=[](__m256 x)->__m256{
+			static constexpr __m256 ones=FILL8(1);
+			static constexpr __m256i iones=FILL4(0x01'00'00'00'01);
+			static constexpr __m256 twos=FILL8(2);
+			static constexpr __m256i itwos=FILL4(0x02'00'00'00'02);
+			__m256i i=(_mm256_cvtps_epi32(_mm256_mul_ps(x,twos)));
+			i=_mm256_sub_epi32(_mm256_mul_epi32(_mm256_and_ps(i,iones),itwos),iones);
+			return _mm256_cvtepi32_ps(i);
+		};
+
+		[[maybe_unused]]
+		auto tri8f=[&square8f](__m256 x)->__m256{
+			static constexpr __m256 zeros=FILL8(0);
+			static constexpr __m256 ones=FILL8(1);
+			static constexpr __m256 twos=FILL8(2);
+			__m256 mx=_mm256_sub_ps(zeros,x);
+			__m256 sq=square8f(x);
+			__m256 a=_mm256_add_ps(sq,ones);
+			__m256 b=_mm256_sub_ps(ones,sq);
+			x=_mm256_floor_ps(x);
+			mx=_mm256_floor_ps(mx);
+			x=_mm256_mul_ps(x,a);
+			mx=_mm256_mul_ps(mx,b);
+			return _mm256_sub_ps(_mm256_mul_ps(_mm256_add_ps(x,mx),twos),ones);
+		};
+
+
+		__m256 toff;
+		for(int i=0;i<8;i++) toff[i]=(float)i;
+	
 		for(int key=0;key<128;key++) if(fabsf(key_volumes[key])>1e-6){
 			const float vol=key_volumes[key];
 			const float f=freqs[key];
-			for(uint32_t smp=smp_min;smp<smp_max;smp++){
-				const float t=(float)smp/(float)smp_per_sec;
-
-				[[maybe_unused]]
-				static auto squaref=[](float _t)->float{
-					return (float)(2*(((int)(_t*2))%2)-1);
+			__m256 vsec_per_smp=FILL8(1/(float)smp_per_sec);
+			__m256 coef=FILL8(2*pi*f);
+			__m256 vvol=FILL8(vol);
+			__m256 vf=FILL8(f);
+			__m256 decay=FILL8(1);//.9999f);
+			for(uint32_t smp=smp_min;smp<smp_max;smp+=8){
+				__m256 t=FILL8((float)smp);
+				t=_mm256_add_ps(t,toff);
+				t=_mm256_mul_ps(t,vsec_per_smp);
+				__m256 x=FILL8(0);
+				#if 0
+				static constexpr __m256 overtone_amp[6]={
+					FILL8(1.0f),FILL8(1.0f),FILL8(1.0f),FILL8(1.0f),FILL8(1.0f),FILL8(1.0f),
 				};
+				for(float i=1;i<=6;i++){
+					__m256 vi=FILL8(i);
+					__m256 w=_mm256_mul_ps(coef,vi);
+					__m256 s=sin8f(_mm256_mul_ps(w,t));
+					s=_mm256_mul_ps(s,overtone_amp[(int)i-1]);
+					x=_mm256_add_ps(x,s);
+				}
+				#else
+				// x=sin8f(_mm256_mul_ps(coef,t));
+				// x=saw8f(_mm256_mul_ps(vf,t));
+				// x=square8f(_mm256_mul_ps(vf,t));
+				x=tri8f(_mm256_mul_ps(vf,t));
 
-				[[maybe_unused]]
-				static auto sawf=[](float _t)->float{
-					return 2*fmodf(_t,1)-1;
-				};
-
-				[[maybe_unused]]
-				static auto trigf=[](float _t)->float{
-					float x=fmodf(_t,1);
-					float y=fmodf(_t,.5);
-					float z=fmodf(_t,.25);
-					if(y>.25) z=1-z;
-					if(x>.5) z*=-1;
-					return z;
-				};
-
-				[[maybe_unused]]
-				static auto testf=[](float _t)->float{
-					return 	1/1.0f*sinf(2*pi*1*_t)+
-							1/2.0f*sinf(2*pi*2*_t)+
-							1/3.0f*sinf(2*pi*3*_t)+
-							1/4.0f*sinf(2*pi*4*_t)+
-							1/5.0f*sinf(2*pi*5*_t);
-				};
-
-				// const float wave=sinf(2*pi*f*t);
-				// const float wave=squaref(f*t);
-				// const float wave=sawf(f*t);
-				// const float wave=trigf(f*t);
-				const float wave=testf(f*t);
-				fbuf[smp]+=vol*wave;
+				#endif
+				x=_mm256_mul_ps(vvol,x);
+				memcpy(fbuf+smp,&x,sizeof(__m256));
+				vvol=_mm256_mul_ps(vvol,decay);
 			}
-			key_volumes[key]*=.9f;
+			key_volumes[key]=vvol[0];
 		}
 	}
 	for(uint32_t i=0;i<reg_sizes[0]/4;i++){
